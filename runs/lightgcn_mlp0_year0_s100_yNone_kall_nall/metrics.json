@@ -1,0 +1,43 @@
+{
+  "config": {
+    "data_dir": "/home/dake/reviewer_rec/SeWon/reviewer_rec_new/dataset/kdd_2hop",
+    "cache_dir": "/home/dake/reviewer_rec/SeWon/reviewer_rec_new/LightGCN_reviewer/cache",
+    "save_dir": "/home/dake/reviewer_rec/SeWon/reviewer_rec_new/LightGCN_reviewer/runs",
+    "model_name": "lightgcn_mlp0_year0_s100_yNone_kall_nall",
+    "model": "lightgcn",
+    "sim_percent": 100,
+    "year_gap": null,
+    "mlp": 0,
+    "year_mode": 0,
+    "prompt_path": "/home/dake/reviewer_rec/SeWon/reviewer_rec_new/LightGCN_reviewer/cache/prompt_year_embeddings.pt",
+    "n_layers": 2,
+    "hidden": 256,
+    "dim": 64,
+    "t2v_dim": 17,
+    "topk": 0,
+    "review_year": 0,
+    "train_sim_percent": 25,
+    "train_year_gap": 5,
+    "lr": 0.001,
+    "batch": 16384,
+    "tau": 0.05,
+    "max_epochs": 200,
+    "eval_every": 5,
+    "patience": 10,
+    "seed": 0,
+    "gpu_id": 0,
+    "topks": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "review_years": [
+      null,
+      3,
+      4,
+      5
+    ]
+  }
+}
