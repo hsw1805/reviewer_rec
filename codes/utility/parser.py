@@ -10,7 +10,7 @@ def none_or_int(v):
 
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(description="전처리한 인용 그래프 + LightGCN (+MLP, +연도) 리뷰어 추천")
+    p = argparse.ArgumentParser(description="전처리한 인용 그래프 + LightGCN (+MLP, +GCL, +연도) 리뷰어 추천")
 
     # 경로
     p.add_argument("--data_dir", default=str(PROJECT.parent / "dataset/kdd_2hop"),
@@ -19,8 +19,9 @@ def parse_args(argv=None):
     p.add_argument("--save_dir", default=str(PROJECT / "runs"), help="결과 저장 폴더")
     p.add_argument("--model_name", default=None, help="결과 폴더 이름 (없으면 설정으로 자동)")
 
-    p.add_argument("--model", choices=["lightgcn", "specter2"], default="lightgcn",
-                   help="lightgcn: 전처리 그래프로 전파 / specter2: 전파 없이 초기 임베딩 그대로 (그래프·MLP 인자 무시)")
+    p.add_argument("--model", choices=["lightgcn", "lightgcn+gcl", "specter2"], default="lightgcn",
+                   help="lightgcn: 전처리 그래프로 전파 / lightgcn+gcl: kNN view × 인용 그래프 view 대조학습(GRACE)으로 "
+                        "초기 임베딩을 학습한 뒤 전파 / specter2: 전파 없이 초기 임베딩 그대로 (그래프·MLP 인자 무시)")
 
     # 1) input graph 전처리
     p.add_argument("--sim_percent", type=int, default=100, help="인용 edge 중 source별 SPECTER2 cos 상위 몇 %%를 남길지 (25/50/75/100)")
@@ -51,6 +52,16 @@ def parse_args(argv=None):
     p.add_argument("--max_epochs", type=int, default=200)
     p.add_argument("--eval_every", type=int, default=5, help="몇 에폭마다 valid를 잴지")
     p.add_argument("--patience", type=int, default=10, help="valid 개선이 없는 평가 횟수가 이만큼이면 멈춤")
+
+    # 5) 대조학습 (lightgcn+gcl일 때만)
+    p.add_argument("--knn_k", type=int, default=100, help="view1 kNN 그래프: 논문마다 SPECTER2 cos 상위 k편")
+    p.add_argument("--view2_sim_percent", type=int, default=50, help="view2 인용 그래프의 유사도 상위 %%")
+    p.add_argument("--view2_year_gap", type=none_or_int, default=5, help="view2 인용 그래프의 최대 연도 차")
+    p.add_argument("--gcl_steps", type=int, default=100, help="학습 step 수 (valid·얼리스타핑 없음)")
+    p.add_argument("--gcl_batch", type=int, default=8192, help="step마다 뽑는 노드 수 (batch 안 다른 노드가 negative)")
+    p.add_argument("--gcl_lr", type=float, default=1e-3)
+    p.add_argument("--gcl_tau", type=float, default=0.5, help="GRACE 온도")
+
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--gpu_id", type=int, default=0)
     args = p.parse_args(argv)
@@ -58,6 +69,8 @@ def parse_args(argv=None):
         args.prompt_path = str(Path(args.cache_dir) / "prompt_year_embeddings.pt")
     if args.model == "specter2" and args.mlp:
         p.error("--model specter2 는 전파·학습이 없어서 --mlp 1 을 쓸 수 없다")
+    if args.model == "lightgcn+gcl" and args.mlp:
+        p.error("--model lightgcn+gcl 은 MLP 없이 초기 임베딩 테이블을 직접 학습해서 --mlp 1 을 쓸 수 없다")
     args.topks = [1, 2, 3, 4, 5] if args.topk == 0 else [args.topk]
     args.review_years = [None, 3, 4, 5] if args.review_year == 0 else [args.review_year]
     if args.model_name is None:
@@ -65,6 +78,9 @@ def parse_args(argv=None):
         n = "all" if args.review_year == 0 else args.review_year
         if args.model == "specter2":
             args.model_name = f"specter2_year{args.year_mode}_k{k}_n{n}"
+        elif args.model == "lightgcn+gcl":
+            args.model_name = (f"lightgcn_gcl_year{args.year_mode}_s{args.sim_percent}_y{args.year_gap}_knn{args.knn_k}"
+                               f"_v2s{args.view2_sim_percent}_y{args.view2_year_gap}_k{k}_n{n}_seed{args.seed}")
         else:
             args.model_name = (f"lightgcn_mlp{args.mlp}_year{args.year_mode}_s{args.sim_percent}_y{args.year_gap}"
                                f"_k{k}_n{n}" + (f"_seed{args.seed}" if args.mlp else ""))

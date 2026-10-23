@@ -1,6 +1,7 @@
-"""데이터 전처리: input graph, valid 세트, prompt year 임베딩. 결과는 cache_dir에 저장하고 main.py가 다시 쓴다.
+"""데이터 전처리: input graph, kNN 그래프, valid 세트, prompt year 임베딩. 결과는 cache_dir에 저장하고 main.py가 다시 쓴다.
 
   python data/build_data.py --sim_percent 75 --year_gap 3     # 그래프 하나 미리 만들기
+  python data/build_data.py --knn --knn_k 100                 # lightgcn+gcl의 kNN 그래프
   python data/build_data.py --valid                           # valid 세트
   python data/build_data.py --prompt                          # year_mode 1용 임베딩 (89만 편 다시 인코딩, GPU 수 시간)
 """
@@ -48,6 +49,32 @@ def build_graph(data, sim_percent, year_gap, cache_dir, device="cpu"):
         g = g[(g[s].map(data.years) - g[t].map(data.years)).abs() <= year_gap]
     a, b = data.index.get_indexer(g[s]), data.index.get_indexer(g[t])
     pairs = np.unique(np.column_stack([np.minimum(a, b), np.maximum(a, b)]), axis=0).astype(np.int64)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(path, pairs)
+    return pairs
+
+
+@torch.no_grad()
+def build_knn(data, k, cache_dir, device="cpu", chunk=4096):
+    """SPECTER2 cos kNN 그래프 (lightgcn+gcl의 view1). 반환: 무방향 쌍 [U, 2] (행 번호, a < b).
+    ① 논문마다 cos 상위 k편 (자기 자신 제외, 전체 논문 대상) ② 무방향으로 합치고 중복 제거
+    ③ 양 끝 중 연도 없는 논문(쿼리 7편은 2020으로 보므로 남는다)이 있는 쌍은 뺀다 — 인용 그래프 ①과 같은 기준."""
+    path = Path(cache_dir) / f"knn_k{k}.npy"
+    if path.is_file():
+        return np.load(path)
+    x = F.normalize(data.embeddings, dim=1).half().to(device)
+    nbr = torch.empty(data.n, k, dtype=torch.int64)
+    for i in range(0, data.n, chunk):
+        s = x[i:i + chunk] @ x.T
+        s[torch.arange(len(s), device=device), torch.arange(i, i + len(s), device=device)] = -float("inf")
+        nbr[i:i + chunk] = s.topk(k, dim=1).indices.cpu()
+    del x, s
+    a = torch.arange(data.n).repeat_interleave(k).to(device)
+    b = nbr.reshape(-1).to(device)
+    keys = torch.unique(torch.minimum(a, b) * data.n + torch.maximum(a, b))
+    pairs = torch.stack([keys // data.n, keys % data.n], dim=1).cpu().numpy()
+    valid = ~np.isnan(data.row_years)
+    pairs = pairs[valid[pairs[:, 0]] & valid[pairs[:, 1]]]
     path.parent.mkdir(parents=True, exist_ok=True)
     np.save(path, pairs)
     return pairs
@@ -157,16 +184,20 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--valid", action="store_true")
     ap.add_argument("--prompt", action="store_true")
+    ap.add_argument("--knn", action="store_true")
     extra, rest = ap.parse_known_args()
     args = parse_args(rest)
     if extra.prompt:
         build_prompt_embeddings(args.data_dir, args.cache_dir)
     else:
         data = Data(args.data_dir)
+        dev = f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu"
         if extra.valid:
             v = build_valid(data, args.cache_dir)
             print("valid 가짜 쿼리", len(v["pseudo_ids"]))
+        elif extra.knn:
+            pairs = build_knn(data, args.knn_k, args.cache_dir, dev)
+            print(f"kNN k{args.knn_k}: 무방향 edge {len(pairs)}")
         else:
-            dev = f"cuda:{args.gpu_id}" if torch.cuda.is_available() else "cpu"
             pairs = build_graph(data, args.sim_percent, args.year_gap, args.cache_dir, dev)
             print(f"graph s{args.sim_percent}_y{args.year_gap}: 무방향 edge {len(pairs)} (방향 {2 * len(pairs)})")

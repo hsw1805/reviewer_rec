@@ -1,8 +1,9 @@
-"""전처리한 인용 그래프 + LightGCN (+MLP, +연도) 리뷰어 추천. 사용법은 README.md.
+"""전처리한 인용 그래프 + LightGCN (+MLP, +GCL, +연도) 리뷰어 추천. 사용법은 README.md.
 
   python main.py --model specter2 --topk 0 --review_year 0
   python main.py --model lightgcn --sim_percent 100 --year_gap none --mlp 0 --year_mode 0 --topk 1
   python main.py --model lightgcn --sim_percent 75 --year_gap 3 --mlp 1 --year_mode 3 --topk 0 --review_year 3
+  python main.py --model lightgcn+gcl --knn_k 100 --view2_sim_percent 50 --view2_year_gap 5 --year_mode 3 --topk 0 --review_year 0
 """
 import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -17,8 +18,8 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 
-from Models import LightGCN, norm_adj
-from data.build_data import build_graph, build_valid, query_citing_pairs
+from Models import LightGCN, LightGCNGCL, ProjectionHead, norm_adj
+from data.build_data import build_graph, build_knn, build_valid, query_citing_pairs
 from utility.batch_test import test, ValidScorer
 from utility.load_data import Data
 from utility.metrics import METRICS
@@ -132,6 +133,36 @@ def train(args, data, model, device, out, t0):
     return {"best_epoch": best["epoch"], "stop_epoch": stop, "best_valid_MRR": best["MRR"], "valid_MRR_epoch0": curve[0]["valid_MRR"]}
 
 
+def train_gcl(args, data, model, device, out, t0):
+    """대조학습 (GRACE). step마다 연도 있는 논문 중 무작위 gcl_batch개의 두 view를 맞춘다.
+    정해진 step만큼 돌고 마지막 모델로 평가한다 (valid·얼리스타핑 없음)."""
+    proj = ProjectionHead(model.dim).to(device)
+    params = list(model.parameters()) + list(proj.parameters())
+    opt = torch.optim.Adam(params, lr=args.gcl_lr)
+    nodes = torch.as_tensor(np.flatnonzero(~np.isnan(data.row_years)), device=device)
+    gen = torch.Generator(device=device).manual_seed(args.seed)
+    t2_init = model.t2.detach().cpu().clone()
+    log(f"GCL 학습 노드 {len(nodes)}, step {args.gcl_steps} × batch {args.gcl_batch}, "
+        f"학습 파라미터 {sum(p.numel() for p in params)}", t0)
+    curve = []
+    for step in range(1, args.gcl_steps + 1):
+        rows = nodes[torch.randint(len(nodes), (args.gcl_batch,), device=device, generator=gen)]
+        loss = model.loss(rows, proj, args.gcl_tau)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+        curve.append({"step": step, "loss": loss.item(), "time_s": round(time.time() - t0)})
+        if step == 1 or step % 25 == 0 or step == args.gcl_steps:
+            log(f"step {step:3d} | loss {curve[-1]['loss']:.4f}", t0)
+    pd.DataFrame(curve).to_csv(out / "curve.csv", index=False)
+    del opt, proj, params
+    model.t2.grad = None
+    torch.cuda.empty_cache()
+    t2_cos = float(F.cosine_similarity(model.t2.detach().cpu(), t2_init, dim=1).median())
+    log(f"학습 후 T2 vs E0 cos 중앙값 {t2_cos:.4f}", t0)
+    return {"loss_step1": curve[0]["loss"], "loss_last": curve[-1]["loss"], "T2_vs_E0_cos_median": t2_cos}
+
+
 def main():
     args = parse_args()
     t0 = time.time()
@@ -151,11 +182,22 @@ def main():
         pairs = build_graph(data, args.sim_percent, args.year_gap, args.cache_dir, device)
         adj, n_layers = norm_adj(pairs, data.n, device), args.n_layers
         log(f"input graph s{args.sim_percent}_y{args.year_gap}: 무방향 edge {len(pairs)}", t0)
-    model = LightGCN(x, tau, tau_valid, adj, args.year_mode, args.mlp, args.hidden, args.dim, n_layers, args.t2v_dim,
-                     args.seed, device)
-    del x
-
-    extra = train(args, data, model, device, out, t0) if args.mlp else {}
+    if args.model == "lightgcn+gcl":
+        knn = build_knn(data, args.knn_k, args.cache_dir, device)
+        adj_knn = norm_adj(knn, data.n, device)
+        v2 = build_graph(data, args.view2_sim_percent, args.view2_year_gap, args.cache_dir, device)
+        log(f"view1 kNN k{args.knn_k}: 무방향 edge {len(knn)} / view2 s{args.view2_sim_percent}_y{args.view2_year_gap}: "
+            f"무방향 edge {len(v2)}", t0)
+        model = LightGCNGCL(x, tau, tau_valid, adj, adj_knn, norm_adj(v2, data.n, device), args.year_mode, n_layers,
+                            args.t2v_dim, args.seed)
+        del x, knn, adj_knn, v2
+        torch.cuda.empty_cache()
+        extra = train_gcl(args, data, model, device, out, t0)
+    else:
+        model = LightGCN(x, tau, tau_valid, adj, args.year_mode, args.mlp, args.hidden, args.dim, n_layers,
+                         args.t2v_dim, args.seed, device)
+        del x
+        extra = train(args, data, model, device, out, t0) if args.mlp else {}
     H = model.output(data.eval_rows)
     results = test(data, data.eval_rows, H, args.topks, args.review_years)
     save_results(out, args, results, extra)

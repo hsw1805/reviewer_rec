@@ -1,0 +1,53 @@
+{
+  "config": {
+    "data_dir": "/tmp/claude-1000/-home-user-USA/20006835-e1d3-4359-8614-2dbbacc03c90/scratchpad/kdd_2hop",
+    "cache_dir": "/tmp/claude-1000/-home-user-USA/20006835-e1d3-4359-8614-2dbbacc03c90/scratchpad/cache",
+    "save_dir": "/tmp/claude-1000/-home-user-USA/20006835-e1d3-4359-8614-2dbbacc03c90/scratchpad/runs",
+    "model_name": "lightgcn_gcl_year3_s100_yNone_knn100_v2s50_y5_kall_nall_seed0",
+    "model": "lightgcn+gcl",
+    "sim_percent": 100,
+    "year_gap": null,
+    "mlp": 0,
+    "year_mode": 3,
+    "prompt_path": "/tmp/claude-1000/-home-user-USA/20006835-e1d3-4359-8614-2dbbacc03c90/scratchpad/cache/prompt_year_embeddings.pt",
+    "n_layers": 2,
+    "hidden": 256,
+    "dim": 64,
+    "t2v_dim": 17,
+    "topk": 0,
+    "review_year": 0,
+    "train_sim_percent": 25,
+    "train_year_gap": 5,
+    "lr": 0.001,
+    "batch": 16384,
+    "tau": 0.05,
+    "max_epochs": 200,
+    "eval_every": 5,
+    "patience": 10,
+    "knn_k": 100,
+    "view2_sim_percent": 50,
+    "view2_year_gap": 5,
+    "gcl_steps": 100,
+    "gcl_batch": 8192,
+    "gcl_lr": 0.001,
+    "gcl_tau": 0.5,
+    "seed": 0,
+    "gpu_id": 0,
+    "topks": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "review_years": [
+      null,
+      3,
+      4,
+      5
+    ]
+  },
+  "loss_step1": 9.44359302520752,
+  "loss_last": 7.82056999206543,
+  "T2_vs_E0_cos_median": 0.999979555606842
+}

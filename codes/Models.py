@@ -26,6 +26,15 @@ class SpMM(torch.autograd.Function):
         return None, torch.sparse.mm(ctx.adj, g.contiguous())
 
 
+def propagate(adj, x, n_layers, rows=slice(None)):
+    """mean(x, Âx, ..., Â^L x)[rows] (역전파 가능). rows 행만 더해 두어 메모리를 아낀다."""
+    acc, h = x[rows], x
+    for _ in range(n_layers):
+        h = SpMM.apply(adj, h)
+        acc = acc + h[rows]
+    return acc / (n_layers + 1)
+
+
 class Time2Vec(nn.Module):
     """[ω0·τ + φ0, sin(ω_i·τ + φ_i)]_{i=1..k-1}. 연도 없는 논문은 0벡터. ω ~ N(0, 0.5²), φ ~ U(0, 2π) (seed 고정)."""
 
@@ -108,3 +117,87 @@ class LightGCN(nn.Module):
                 acc += e
             out.append((acc / (self.n_layers + 1))[rows_t].cpu())
         return torch.cat(out, dim=1)
+
+
+class ProjectionHead(nn.Module):
+    """GRACE의 2층 projection (두 view 공유). loss에만 쓰고, 평가는 projection 전 임베딩으로 한다."""
+
+    def __init__(self, dim):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(dim, dim), nn.ELU(), nn.Linear(dim, dim))
+
+    def forward(self, z):
+        return self.net(z)
+
+
+def grace_loss(h1, h2, tau=0.5):
+    """GRACE NT-Xent. positive = 같은 노드의 두 view, negative = batch 안 다른 노드 (view 사이 + view 안)."""
+    h1, h2 = F.normalize(h1, dim=1), F.normalize(h2, dim=1)
+    e12, e11, e22 = (torch.exp(a @ b.T / tau) for a, b in ((h1, h2), (h1, h1), (h2, h2)))
+    pos = e12.diag()
+    l1 = -torch.log(pos / (e12.sum(1) + e11.sum(1) - e11.diag()))
+    l2 = -torch.log(pos / (e12.sum(0) + e22.sum(1) - e22.diag()))
+    return 0.5 * (l1 + l2).mean()
+
+
+class LightGCNGCL(nn.Module):
+    """kNN 그래프 view × 인용 그래프 view 대조학습 (GRACE) 후 LightGCN 전파.
+
+      view1: T1 = E0 (고정)          ── kNN 그래프 Â_knn ── LightGCN ──▶ z1
+      view2: T2 = E0로 시작 (학습)    ── view2 그래프 Â_v2 ── LightGCN ──▶ z2
+      L = GRACE( proj(z1), proj(z2) ),  proj = 2층 projection (두 view 공유)
+      최종 H = 학습된 T2를 input graph Â로 전파
+
+    E0 = [연도 특징 | 텍스트 임베딩] (LightGCN과 같은 year_mode).
+      year_mode 0·1: T2 = 텍스트 임베딩 / 2: T2 = [τ | SPECTER2] (τ 열도 학습)
+      year_mode 3: T2 = SPECTER2, Time2Vec(ω, φ)은 두 view가 공유해 학습
+    """
+
+    def __init__(self, x, tau, tau_valid, adj, adj_knn, adj_v2, year_mode=0, n_layers=2, t2v_dim=17, seed=0):
+        """adj_knn은 고정된 view1을 한 번 전파하는 데만 쓰고 들고 있지 않는다."""
+        super().__init__()
+        self.device = device = adj.device
+        self.adj, self.adj_v2, self.year_mode, self.n_layers = adj, adj_v2, year_mode, n_layers
+        x = x.to(device)
+        if year_mode == 2:
+            x = torch.cat([tau.to(device).unsqueeze(1), x], dim=1)
+        self.tau, self.tau_valid = tau.to(device), tau_valid.to(device)
+        self.t2v = Time2Vec(t2v_dim, seed).to(device) if year_mode == 3 else None
+        self.dim = x.shape[1] + (t2v_dim if year_mode == 3 else 0)
+        with torch.no_grad():
+            self.z1 = propagate(adj_knn, x, n_layers)                 # T1은 고정이라 한 번만 전파
+            if year_mode == 3:
+                # Time2Vec 블록은 연도에만 의존 → 연도 one-hot을 kNN으로 미리 전파해 두면 z1 블록 = M · T2V(연도값)
+                key = torch.where(self.tau_valid > 0, self.tau, torch.full_like(self.tau, -100.0))
+                uniq, inv = torch.unique(key, return_inverse=True)
+                self.uniq_valid = (uniq != -100.0).float()
+                self.uniq_tau = uniq * self.uniq_valid
+                onehot = torch.zeros(len(key), len(uniq), device=device)
+                onehot[torch.arange(len(key), device=device), inv] = 1.0
+                self.m_knn = propagate(adj_knn, onehot, n_layers)
+                del onehot
+        self.t2 = nn.Parameter(x)
+
+    def year_block(self):
+        return self.t2v(self.tau, self.tau_valid)
+
+    def view1(self, rows):
+        z = self.z1[rows]
+        if self.t2v is not None:
+            z = torch.cat([self.m_knn[rows] @ self.t2v(self.uniq_tau, self.uniq_valid), z], dim=1)
+        return z
+
+    def view2(self, rows, adj=None):
+        adj = self.adj_v2 if adj is None else adj
+        z = propagate(adj, self.t2, self.n_layers, rows)
+        if self.t2v is not None:
+            z = torch.cat([propagate(adj, self.year_block(), self.n_layers, rows), z], dim=1)
+        return z
+
+    def loss(self, rows, proj, tau):
+        return grace_loss(proj(self.view1(rows)), proj(self.view2(rows)), tau)
+
+    @torch.no_grad()
+    def output(self, rows):
+        """rows 행의 최종 임베딩 H[rows] = 학습된 T2를 input graph로 전파 (CPU)."""
+        return self.view2(torch.as_tensor(rows, device=self.device), self.adj).cpu()

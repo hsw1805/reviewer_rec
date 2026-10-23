@@ -12,6 +12,17 @@ SPECTER2 (+연도) ──[MLP]──▶ E0 ──LightGCN 전파 (전처리한 �
 
 `--model specter2`는 전파 없이 E0 그대로 리뷰어 점수를 낸다 (기준선).
 
+### LightGCN + GCL (kNN view × 인용 그래프 view 대조학습)
+
+`--model lightgcn+gcl`. MLP 없이 초기 임베딩 테이블을 직접 학습한다. SPECTER2 kNN 그래프와 전처리한 인용 그래프를 두 view로 GRACE 대조학습을 하고, 학습된 테이블을 input graph로 전파한다.
+
+```
+view1: T1 = E0 (고정)          ──kNN 그래프 (knn_k)──────────────▶ LightGCN ──▶ z1
+view2: T2 = E0로 시작 (학습)    ──view2 그래프 (view2_sim/year)──▶ LightGCN ──▶ z2
+L = GRACE( proj(z1), proj(z2) ),  proj = 2층 projection (두 view 공유)
+최종 H = T2 ──LightGCN 전파 (input graph)──▶ H ──▶ 리뷰어 점수 (위와 같음)
+```
+
 ## 구조
 
 ```
@@ -21,8 +32,8 @@ LightGCN_reviewer/
 ├── runs/<model_name>/        # 결과: metrics.csv (조합 × 세트 × 지표 10개), metrics.json, per_query.csv, curve.csv(학습 시)
 └── codes/
     ├── main.py               # 실행: 그래프 → 모델 → (학습) → 평가
-    ├── Models.py             # LightGCN, Time2Vec, 정규화 인접행렬
-    ├── data/build_data.py    # input graph 전처리, valid 세트, prompt year 임베딩 생성
+    ├── Models.py             # LightGCN, LightGCNGCL(+projection, GRACE loss), Time2Vec, 정규화 인접행렬
+    ├── data/build_data.py    # input graph 전처리, kNN 그래프, valid 세트, prompt year 임베딩 생성
     └── utility/
         ├── parser.py         # 하이퍼파라미터
         ├── load_data.py      # 임베딩·연도·리뷰어·정답 읽기
@@ -42,13 +53,17 @@ python main.py --model specter2 --topk 0 --review_year 0                        
 python main.py --model lightgcn --sim_percent 100 --year_gap none --mlp 0 --year_mode 0   # 전파만
 python main.py --model lightgcn --sim_percent 75 --year_gap 3 --mlp 0 --year_mode 2 --topk 3 --review_year 3
 python main.py --model lightgcn --sim_percent 100 --year_gap none --mlp 1 --year_mode 3 --topk 0 --review_year 0   # MLP 학습
+python main.py --model lightgcn+gcl --knn_k 100 --view2_sim_percent 50 --view2_year_gap 5 --year_mode 3 --topk 0 --review_year 0   # GCL 학습
 ```
+
+kNN 그래프는 처음 실행할 때 `cache/knn_k{k}.npy`로 만들어진다 (`python data/build_data.py --knn --knn_k 100`으로 미리 만들 수도 있다).
+그리드는 인자를 바꿔 여러 번 실행한다. 예: `for k in 50 100 150 200; do for s in 100 75 50; do python main.py --model lightgcn+gcl --knn_k $k --view2_sim_percent $s --view2_year_gap 5 --year_mode 3 --topk 0 --review_year 0; done; done`
 
 ## 하이퍼파라미터
 
 | 인자 | 기본값 | 의미 |
 |---|---|---|
-| **`--model`** | lightgcn | lightgcn: 전처리 그래프로 전파 / specter2: 전파 없이 E0 그대로 (그래프·MLP 인자 무시, `--mlp 1` 불가) |
+| **`--model`** | lightgcn | lightgcn: 전처리 그래프로 전파 / lightgcn+gcl: GCL로 E0 테이블을 학습한 뒤 전파 (`--mlp 1` 불가) / specter2: 전파 없이 E0 그대로 (그래프·MLP 인자 무시, `--mlp 1` 불가) |
 | **`--sim_percent`** | 100 | input graph 전처리: 인용 edge 중 인용한 논문별 SPECTER2 cos 상위 몇 %를 남길지 |
 | **`--year_gap`** | none | input graph 전처리: 양 끝 논문 연도 차가 n년 이하인 edge만 (`none` = 제한 없음) |
 | **`--mlp`** | 0 | 0: 초기 임베딩을 그대로 전파 (학습 없음) / 1: MLP를 거쳐 전파, MLP 학습 |
@@ -62,8 +77,11 @@ python main.py --model lightgcn --sim_percent 100 --year_gap none --mlp 1 --year
 | `--train_sim_percent`, `--train_year_gap` | 25, 5 | 학습 positive edge 그래프 (`--mlp 1`) |
 | `--lr`, `--batch`, `--tau` | 1e-3, 16384, 0.05 | Adam 학습률, 배치(쌍), BPR 온도 |
 | `--max_epochs`, `--eval_every`, `--patience` | 200, 5, 10 | 최대 에폭, valid 측정 주기, 얼리스타핑 |
+| **`--knn_k`** | 100 | view1 kNN 그래프: 논문마다 SPECTER2 cos 상위 k편 (`lightgcn+gcl`) |
+| **`--view2_sim_percent`**, **`--view2_year_gap`** | 50, 5 | view2 인용 그래프 (input graph 전처리와 같은 방식, `lightgcn+gcl`) |
+| `--gcl_steps`, `--gcl_batch`, `--gcl_lr`, `--gcl_tau` | 100, 8192, 1e-3, 0.5 | GCL 학습 step 수, step마다 뽑는 노드 수, Adam 학습률, GRACE 온도 |
 | `--seed`, `--gpu_id` | 0, 0 | |
-| `--data_dir`, `--cache_dir`, `--save_dir`, `--model_name` | | 경로. 결과 폴더 이름은 기본으로 설정에서 자동 생성 (`mlp1_year3_s100_yNone_k1_seed0`) |
+| `--data_dir`, `--cache_dir`, `--save_dir`, `--model_name` | | 경로. 결과 폴더 이름은 기본으로 설정에서 자동 생성 (`mlp1_year3_s100_yNone_k1_seed0`, `lightgcn_gcl_year3_s100_yNone_knn100_v2s50_y5_kall_nall_seed0`) |
 
 ## 각 단계
 
@@ -106,6 +124,15 @@ H = (E0 + ÂE0 + Â²E0) / 3 (`n_layers = 2`). 별도의 변환 행렬·비선�
 - 데이터 폴더의 `test_answers_*.jsonl`을 전부 평가한다(soft, hard, soft/hard_25y3·25y4·25y5). 정답 리뷰어 0명인 쿼리만 평균에서 뺀다.
 - 지표 10개: P@1~5, P@10, NDCG@5, NDCG@10, MRR, AUC. 동점은 리뷰어 ID 순, P@k 분모는 항상 k.
 
+### 6. GCL 학습 (`--model lightgcn+gcl`, `main.py: train_gcl`, `Models.py: LightGCNGCL`)
+- view1 그래프 (`data/build_data.py: build_knn`): 논문마다 SPECTER2 cos 상위 `knn_k`편(자기 자신 제외)을 무방향으로 합친다. 양 끝 중 연도 없는 논문이 있는 쌍은 뺀다(인용 그래프 ①과 같은 기준, 쿼리 7편은 2020년으로 보므로 남는다).
+- view2 그래프: `build_graph(view2_sim_percent, view2_year_gap)`. input graph 전처리와 같은 방식이다.
+- T1 = E0 고정, T2 = E0으로 시작해서 학습. year_mode 2는 τ 열까지 T2에 넣어 학습하고, year_mode 3은 Time2Vec ω, φ를 두 view가 공유해 학습한다.
+  z1 = LightGCN(kNN, T1)은 한 번만 계산한다. Time2Vec 블록은 연도에만 달려 있어서, 연도 one-hot을 kNN으로 미리 전파한 M으로 M · T2V(연도값)을 구한다(매 step 전파하는 것과 같다).
+- step마다 연도 있는 논문 중 무작위 `gcl_batch`개를 뽑아 z1, z2 = LightGCN(view2, T2)를 만들고, 공유 projection(Linear → ELU → Linear)을 거친 GRACE NT-Xent loss(positive = 같은 노드의 두 view, negative = batch 안 다른 노드, τ = `gcl_tau`)로 T2(+Time2Vec)와 projection을 학습한다. Adam, `gcl_steps` step.
+- valid·얼리스타핑 없이 마지막 step의 T2를 input graph(`sim_percent`, `year_gap`, 기본 s100_yNone = 전처리한 원본 인용 그래프)로 전파한 H로 평가한다. projection은 평가에 쓰지 않는다.
+- `curve.csv`에 step별 loss를 남기고, `metrics.json`에 첫·마지막 loss와 학습 후 T2와 E0의 cos 중앙값(얼마나 바뀌었는지)을 남긴다.
+
 ## 결과 (kdd_2hop, 학습 없음)
 
 `runs/specter2_year0_kall_nall`, `runs/lightgcn_mlp0_year0_s100_yNone_kall_nall`. P@5, 연도 자르지 않음(review_year none):
@@ -129,3 +156,19 @@ top-k 1~5 × 연도 none/3/4/5 전체, P@10과 지표 10개는 각 폴더의 `me
 | `--mlp 1 --year_mode 0` | 학습 전 valid 0.8625, 1 에폭 loss 0.0055 | | 아이디어 08 1번과 같음 |
 
 그래프 s75_yNone, s25_y5와 valid 세트는 아이디어 02·03의 캐시와 똑같이 만들어진다.
+
+## 결과: LightGCN + GCL (kdd_2hop)
+
+`runs/lightgcn_gcl_year3_s100_yNone_knn100_v2s50_y5_kall_nall_seed0` (기본값: kNN k100, view2 s50_y5, year_mode 3, input graph s100_yNone, 100 step, seed 0). P@5, 연도 자르지 않음(review_year none):
+
+| 모델 | topk | soft | hard | soft_25y3 | hard_25y3 | soft_25y4 | hard_25y4 | soft_25y5 | hard_25y5 |
+|---|---|---|---|---|---|---|---|---|---|
+| LightGCN year3 (학습 없음) | 1 | 0.3667 | 0.1919 | 0.3604 | 0.2406 | 0.3670 | 0.2394 | 0.3750 | 0.2478 |
+| LightGCN year3 (학습 없음) | 4 | 0.3816 | 0.1905 | 0.3683 | 0.2312 | 0.3748 | 0.2303 | 0.3788 | 0.2358 |
+| LightGCN+GCL year3 | 1 | 0.3667 | 0.1919 | 0.3584 | 0.2375 | 0.3650 | 0.2364 | 0.3731 | 0.2448 |
+| LightGCN+GCL year3 | 4 | 0.3839 | 0.1946 | 0.3703 | 0.2344 | 0.3767 | 0.2333 | 0.3808 | 0.2388 |
+
+- 학습 없음 행은 같은 input graph의 `--model lightgcn --mlp 0 --year_mode 3`이다(같은 환경에서 다시 돌림, 위 확인 표의 값과 같다).
+- loss는 9.44 → 7.82 (100 step)로 내려가지만, 학습 후 T2와 E0의 cos 중앙값이 1.0000이다. 테이블이 거의 바뀌지 않아서 학습 없음과 차이가 칸마다 ±0.005 이내(쿼리 1~2개)다.
+- 실행 시간: GPU 1장(RTX 5000 Ada 32GB) 기준 kNN 그래프를 만든 뒤 약 1분 30초. 학습 파라미터는 6.85억 개(T2 테이블 89만 × 768 + Time2Vec + projection)다.
+- 이 코드는 `knn_gcl_gird_search`(별도 데이터 폴더의 kNN × 엣지 필터링 GCL 그리드 서치)를 이 저장소의 데이터·그래프 전처리·연도 방식·평가에 맞춰 옮긴 것이다. 그쪽과 달라진 점: view2 유사도 필터가 전체 edge 상위 %가 아니라 인용한 논문별 상위 %다(`build_graph`). 연도 없는 논문은 지우지 않고 τ = 0으로 두며(edge는 똑같이 빠진다), 연도 방식·Time2Vec 초기값은 이 저장소의 `year_mode`를 따른다. 그래서 수치가 그쪽 결과표와 같지는 않다.
