@@ -28,6 +28,7 @@ L = GRACE( proj(z1), proj(z2) ),  proj = 2층 projection (두 view 공유)
 ```
 LightGCN_reviewer/
 ├── README.md
+├── dataset/                  # 데이터 폴더 (저장소에는 빈 폴더, 아래 '데이터 준비'대로 파일을 넣는다)
 ├── cache/                    # 그래프·valid·prompt 임베딩 캐시 (처음 실행할 때 자동 생성)
 ├── runs/<model_name>/        # 결과: metrics.csv (조합 × 세트 × 지표 10개), metrics.json, per_query.csv, curve.csv(학습 시)
 └── codes/
@@ -42,6 +43,39 @@ LightGCN_reviewer/
 ```
 
 다른 프로젝트 파일(`evaluation.py` 등) 없이 이 폴더와 데이터 폴더만 있으면 돌아간다. 환경: conda `reviewer_rec`.
+
+## 데이터 준비
+
+데이터는 용량이 커서 저장소에 올리지 않았다. `dataset/`은 빈 폴더이고, 실행 전에 아래 파일을 넣는다 (기본 `--data_dir`가 `dataset/`).
+SPECTER2 임베딩(`embedding/`)은 직접 만든다 (아래 "SPECTER2 임베딩 만들기").
+
+```
+dataset/
+├── edges.parquet                    # 인용 edge: source_paper_id → cited_paper_id
+├── papers.parquet                   # 논문 id, 제목, 초록, 연도, 외부 ID
+├── papers_normalized_v2.parquet     # 논문 id, title, abstract, year (그래프 전처리·연도·prompt 인코딩에 사용)
+├── reviewer_papers.jsonl            # {"reviewer_id": ..., "paper_ids": [...]} 리뷰어별 과거 논문
+├── test_answers_*.jsonl             # 정답: soft, hard, soft/hard_25y3·25y4·25y5 ({"query_id": 1, "score": {"리뷰어 id": 0 또는 1}})
+└── embedding/
+    └── specter2_embeddings.pt       # 직접 생성: python data/build_data.py --specter2
+```
+
+- 쿼리(평가 논문)는 id 1~174다. 정답 파일은 폴더에 있는 `test_answers_*.jsonl`을 전부 읽으므로, 일부만 넣으면 그 세트만 평가한다.
+- 다른 위치에 데이터가 있으면 `--data_dir <경로>`로 지정한다.
+
+### SPECTER2 임베딩 만들기
+
+위 parquet·jsonl 파일을 넣은 뒤 한 번 실행한다 (`codes/` 폴더에서).
+
+```bash
+python data/build_data.py --specter2     # → dataset/embedding/specter2_embeddings.pt
+python data/build_data.py --prompt       # (--year_mode 1을 쓸 때만) → cache/prompt_year_embeddings.pt
+```
+
+- 모델: `allenai/specter2_base` + `allenai/specter2` proximity adapter (Hugging Face에서 자동으로 받는다, `adapters` 패키지 필요).
+- 입력: `papers_normalized_v2.parquet`의 `title + [SEP] + abstract` (prompt는 `title + [SEP] + "Year: {year}. " + abstract`). 최대 512 토큰, 마지막 층 CLS 벡터 768차원, 정규화하지 않고 저장.
+- 89만 편을 인코딩하므로 GPU로 수 시간 걸린다. 5만 편마다 `cache/specter2_chunks/`에 저장해서 중간에 끊겨도 다시 실행하면 이어서 돈다.
+- 결과 파일 형식: `{"paper_ids": [N], "embeddings": [N, 768]}`, 행 순서는 `papers_normalized_v2.parquet`과 같다.
 
 ## 실행
 
@@ -81,7 +115,7 @@ kNN 그래프는 처음 실행할 때 `cache/knn_k{k}.npy`로 만들어진다 (`
 | **`--view2_sim_percent`**, **`--view2_year_gap`** | 50, 5 | view2 인용 그래프 (input graph 전처리와 같은 방식, `lightgcn+gcl`) |
 | `--gcl_steps`, `--gcl_batch`, `--gcl_lr`, `--gcl_tau` | 100, 8192, 1e-3, 0.5 | GCL 학습 step 수, step마다 뽑는 노드 수, Adam 학습률, GRACE 온도 |
 | `--seed`, `--gpu_id` | 0, 0 | |
-| `--data_dir`, `--cache_dir`, `--save_dir`, `--model_name` | | 경로. 결과 폴더 이름은 기본으로 설정에서 자동 생성 (`mlp1_year3_s100_yNone_k1_seed0`, `lightgcn_gcl_year3_s100_yNone_knn100_v2s50_y5_kall_nall_seed0`) |
+| `--data_dir`, `--cache_dir`, `--save_dir`, `--model_name` | dataset/, cache/, runs/ | 경로. 결과 폴더 이름은 기본으로 설정에서 자동 생성 (`mlp1_year3_s100_yNone_k1_seed0`, `lightgcn_gcl_year3_s100_yNone_knn100_v2s50_y5_kall_nall_seed0`) |
 
 ## 각 단계
 
@@ -105,7 +139,7 @@ kNN 그래프는 처음 실행할 때 `cache/knn_k{k}.npy`로 만들어진다 (`
 - 연도 없는 논문은 τ = 0(Time2Vec은 0벡터). 연도 없는 쿼리 7편(58, 90, 96, 106, 132, 134, 163)은 2020년으로 둔다.
 - `--mlp 0`: E0 = X. 학습이 없어서 Time2Vec의 ω, φ도 seed로 고정한 초기값 그대로다.
 - `--mlp 1`: E0 = normalize(Linear(256→64)(ReLU(Linear(X→256)))). 텍스트 임베딩은 고정하고 MLP(와 Time2Vec ω, φ)만 학습한다.
-- prompt 임베딩은 `python data/build_data.py --prompt`로 만든다(89만 편을 다시 인코딩, GPU로 수 시간). 지금 `cache/`의 파일은 아이디어 03에서 만든 파일에 걸어 둔 링크다.
+- prompt 임베딩은 `python data/build_data.py --prompt`로 만든다(89만 편을 다시 인코딩, GPU로 수 시간). 위 "SPECTER2 임베딩 만들기" 참고.
 
 ### 3. LightGCN 전파
 H = (E0 + ÂE0 + Â²E0) / 3 (`n_layers = 2`). 별도의 변환 행렬·비선형 없이 이웃 평균만 한다.

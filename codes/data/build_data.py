@@ -1,8 +1,9 @@
-"""데이터 전처리: input graph, kNN 그래프, valid 세트, prompt year 임베딩. 결과는 cache_dir에 저장하고 main.py가 다시 쓴다.
+"""데이터 전처리: SPECTER2 임베딩, input graph, kNN 그래프, valid 세트, prompt year 임베딩. 결과는 cache_dir에 저장하고 main.py가 다시 쓴다.
 
   python data/build_data.py --sim_percent 75 --year_gap 3     # 그래프 하나 미리 만들기
   python data/build_data.py --knn --knn_k 100                 # lightgcn+gcl의 kNN 그래프
   python data/build_data.py --valid                           # valid 세트
+  python data/build_data.py --specter2                        # 기본 SPECTER2 임베딩 → dataset/embedding/specter2_embeddings.pt (GPU 수 시간)
   python data/build_data.py --prompt                          # year_mode 1용 임베딩 (89만 편 다시 인코딩, GPU 수 시간)
 """
 import argparse
@@ -132,51 +133,79 @@ def build_valid(data, cache_dir):
     return out
 
 
-# ---------------------------------------------------------------------- prompt year 임베딩
-def build_prompt_embeddings(data_dir, cache_dir, chunk=50000, tokens_per_batch=16384):
-    """SPECTER2(specter2_base + allenai/specter2 adapter) 입력에 연도를 넣어 다시 인코딩.
-    입력: title + [SEP] + "Year: {year}. " + abstract (연도 없으면 "Year: unknown.", 쿼리 7편은 2020). CLS, max_len 512, fp16."""
+# ---------------------------------------------------------------------- SPECTER2 / prompt year 임베딩
+def load_specter2(device="cuda"):
+    """SPECTER2 = allenai/specter2_base + allenai/specter2 (proximity) adapter."""
     from adapters import AutoAdapterModel
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained("allenai/specter2_base")
     model = AutoAdapterModel.from_pretrained("allenai/specter2_base")
     model.load_adapter("allenai/specter2", source="hf", load_as="specter2", set_active=True)
-    model = model.to("cuda").eval()
+    return tok, model.to(device).eval()
 
-    papers = pd.read_parquet(Path(data_dir) / "papers_normalized_v2.parquet", columns=["id", "title", "abstract", "year"])
+
+def make_texts(papers, sep, with_year):
+    """기본: title + [SEP] + abstract. with_year: title + [SEP] + "Year: {year}. " + abstract
+    (연도 없으면 "Year: unknown.", 연도 없는 쿼리 7편은 2020)."""
+    titles = papers["title"].fillna("").astype(str)
+    abstracts = papers["abstract"].fillna("").astype(str)
+    if not with_year:
+        return [t + sep + a for t, a in zip(titles, abstracts)]
     years = pd.to_numeric(papers["year"], errors="coerce").to_numpy()
     years[np.isin(papers["id"].to_numpy(), QUERY_NO_YEAR)] = 2020
-    texts = [t + tok.sep_token + f"Year: {'unknown' if np.isnan(y) else int(y)}." + (" " + a if a else "")
-             for t, a, y in zip(papers["title"].fillna("").astype(str), papers["abstract"].fillna("").astype(str), years)]
+    return [t + sep + f"Year: {'unknown' if np.isnan(y) else int(y)}." + (" " + a if a else "")
+            for t, a, y in zip(titles, abstracts, years)]
 
-    @torch.inference_mode()
-    def encode(batch_texts):
-        enc = tok(batch_texts, truncation=True, max_length=512, return_token_type_ids=False)["input_ids"]
-        order = np.argsort([len(x) for x in enc])                      # 길이순 배치
-        out, i = torch.empty(len(batch_texts), 768), 0
-        while i < len(order):
-            j = i
-            while j < len(order) and (j - i + 1) * len(enc[order[j]]) <= tokens_per_batch:
-                j += 1
-            idx = order[i:max(j, i + 1)]
-            b = tok.pad({"input_ids": [enc[k] for k in idx]}, return_tensors="pt").to("cuda")
-            with torch.autocast("cuda", dtype=torch.float16):
-                out[torch.as_tensor(idx)] = model(**b).last_hidden_state[:, 0, :].float().cpu()
-            i = max(j, i + 1)
-        return out
 
-    tmp = Path(cache_dir) / "prompt_year_chunks"                       # 끊겨도 이어서 돈다
+@torch.inference_mode()
+def encode(texts, tok, model, tokens_per_batch=16384, device="cuda"):
+    """CLS 벡터 (768, 정규화 안 함). max_len 512, 길이순 배치, fp16 autocast."""
+    enc = tok(texts, truncation=True, max_length=512, return_token_type_ids=False)["input_ids"]
+    order = np.argsort([len(x) for x in enc])
+    out, i = torch.empty(len(texts), 768), 0
+    while i < len(order):
+        j = i
+        while j < len(order) and (j - i + 1) * len(enc[order[j]]) <= tokens_per_batch:
+            j += 1
+        idx = order[i:max(j, i + 1)]
+        b = tok.pad({"input_ids": [enc[k] for k in idx]}, return_tensors="pt").to(device)
+        with torch.autocast("cuda", dtype=torch.float16):
+            out[torch.as_tensor(idx)] = model(**b).last_hidden_state[:, 0, :].float().cpu()
+        i = max(j, i + 1)
+    return out
+
+
+def build_text_embeddings(data_dir, out_path, tmp_dir, with_year, chunk=50000):
+    """papers_normalized_v2.parquet의 모든 논문을 SPECTER2로 인코딩해 {"paper_ids", "embeddings"}로 저장.
+    chunk마다 tmp_dir에 저장해서 끊겨도 이어서 돈다. 89만 편, GPU로 수 시간."""
+    tok, model = load_specter2()
+    papers = pd.read_parquet(Path(data_dir) / "papers_normalized_v2.parquet", columns=["id", "title", "abstract", "year"])
+    texts = make_texts(papers, tok.sep_token, with_year)
+    tmp = Path(tmp_dir)
     tmp.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     n_chunks = (len(texts) + chunk - 1) // chunk
     for c in range(n_chunks):
         p = tmp / f"chunk_{c:03d}.pt"
         if not p.is_file():
-            torch.save(encode(texts[c * chunk:(c + 1) * chunk]), p)
+            torch.save(encode(texts[c * chunk:(c + 1) * chunk], tok, model), p)
             print(f"chunk {c + 1}/{n_chunks} {time.time() - t0:.0f}s", flush=True)
     emb = torch.cat([torch.load(tmp / f"chunk_{c:03d}.pt") for c in range(n_chunks)])
-    torch.save({"paper_ids": torch.as_tensor(papers["id"].to_numpy()), "embeddings": emb},
-               Path(cache_dir) / "prompt_year_embeddings.pt")
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"paper_ids": torch.as_tensor(papers["id"].to_numpy()), "embeddings": emb}, out_path)
+    print("저장:", out_path, tuple(emb.shape))
+
+
+def build_specter2_embeddings(data_dir, cache_dir):
+    """기본 SPECTER2 임베딩 (title [SEP] abstract) → data_dir/embedding/specter2_embeddings.pt"""
+    build_text_embeddings(data_dir, Path(data_dir) / "embedding/specter2_embeddings.pt",
+                          Path(cache_dir) / "specter2_chunks", with_year=False)
+
+
+def build_prompt_embeddings(data_dir, cache_dir):
+    """year_mode 1용 (title [SEP] Year: {year}. abstract) → cache_dir/prompt_year_embeddings.pt"""
+    build_text_embeddings(data_dir, Path(cache_dir) / "prompt_year_embeddings.pt",
+                          Path(cache_dir) / "prompt_year_chunks", with_year=True)
 
 
 if __name__ == "__main__":
@@ -184,10 +213,13 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(add_help=False)
     ap.add_argument("--valid", action="store_true")
     ap.add_argument("--prompt", action="store_true")
+    ap.add_argument("--specter2", action="store_true")
     ap.add_argument("--knn", action="store_true")
     extra, rest = ap.parse_known_args()
     args = parse_args(rest)
-    if extra.prompt:
+    if extra.specter2:
+        build_specter2_embeddings(args.data_dir, args.cache_dir)
+    elif extra.prompt:
         build_prompt_embeddings(args.data_dir, args.cache_dir)
     else:
         data = Data(args.data_dir)

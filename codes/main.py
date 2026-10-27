@@ -1,5 +1,11 @@
 """전처리한 인용 그래프 + LightGCN (+MLP, +GCL, +연도) 리뷰어 추천. 사용법은 README.md.
 
+※ 처음 실행하기 전에 임베딩부터 만든다 (한 번만, GPU 수 시간):
+  1) dataset/에 데이터 파일을 넣는다 (README "데이터 준비")
+  2) python data/build_data.py --specter2     # → dataset/embedding/specter2_embeddings.pt (필수)
+  3) python data/build_data.py --prompt       # → cache/prompt_year_embeddings.pt (--year_mode 1을 쓸 때만)
+  그래프·valid·kNN 그래프는 main.py가 처음 실행할 때 자동으로 만든다.
+
   python main.py --model specter2 --topk 0 --review_year 0
   python main.py --model lightgcn --sim_percent 100 --year_gap none --mlp 0 --year_mode 0 --topk 1
   python main.py --model lightgcn --sim_percent 75 --year_gap 3 --mlp 1 --year_mode 3 --topk 0 --review_year 3
@@ -165,6 +171,12 @@ def train_gcl(args, data, model, device, out, t0):
 
 def main():
     args = parse_args()
+    emb = Path(args.data_dir) / "embedding/specter2_embeddings.pt"
+    if not emb.is_file():
+        raise SystemExit(f"{emb} 가 없다. 먼저 SPECTER2 임베딩을 만든다: python data/build_data.py --specter2 "
+                         f"(데이터 폴더가 다르면 --data_dir도 같이). README '데이터 준비' 참고.")
+    if args.year_mode == 1 and not Path(args.prompt_path).is_file():
+        raise SystemExit(f"{args.prompt_path} 가 없다. --year_mode 1은 먼저 python data/build_data.py --prompt 를 실행한다.")
     t0 = time.time()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)

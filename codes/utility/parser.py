@@ -13,8 +13,8 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description="전처리한 인용 그래프 + LightGCN (+MLP, +GCL, +연도) 리뷰어 추천")
 
     # 경로
-    p.add_argument("--data_dir", default=str(PROJECT.parent / "dataset/kdd_2hop"),
-                   help="edges.parquet, papers_normalized_v2.parquet, reviewer_papers.jsonl, test_answers_*.jsonl, embedding/")
+    p.add_argument("--data_dir", default=str(PROJECT / "dataset"),
+                   help="데이터 폴더 (기본: LightGCN_reviewer/dataset, 저장소에는 빈 폴더). README의 '데이터 준비' 참고")
     p.add_argument("--cache_dir", default=str(PROJECT / "cache"), help="그래프·valid·prompt 임베딩 캐시")
     p.add_argument("--save_dir", default=str(PROJECT / "runs"), help="결과 저장 폴더")
     p.add_argument("--model_name", default=None, help="결과 폴더 이름 (없으면 설정으로 자동)")

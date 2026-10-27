@@ -2,3 +2,5 @@ cache/
 __pycache__/
 *.pyc
 runs/*/per_query.csv
+dataset/*
+!dataset/.gitkeep
